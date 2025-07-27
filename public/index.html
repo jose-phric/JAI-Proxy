@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AkaneAI Proxy</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0f0f0f;
+      --fg: #e5e5e5;
+      --dim: #9ca3af;
+      --accent: #6366f1;
+      --border: #1f2937;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: var(--bg);
+      color: var(--fg);
+      line-height: 1.6;
+      padding: 3rem 1rem;
+      max-width: 800px;
+      margin: auto;
+    }
+
+    h1 {
+      font-size: 2.5rem;
+      font-weight: 700;
+      margin-bottom: 0.3rem;
+    }
+
+    .subtitle {
+      color: var(--dim);
+      margin-bottom: 2rem;
+    }
+
+    h2 {
+      font-size: 1.5rem;
+      margin: 2rem 0 1rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 0.5rem;
+    }
+
+    ul {
+      list-style: disc;
+      padding-left: 1.5rem;
+    }
+
+    li {
+      margin-bottom: 0.6rem;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    .section {
+      margin-top: 2rem;
+    }
+
+    footer {
+      border-top: 1px solid var(--border);
+      margin-top: 3rem;
+      padding-top: 1.5rem;
+      font-size: 0.9rem;
+      color: var(--dim);
+    }
+
+    .tag {
+      background: var(--border);
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: 0.85rem;
+      font-family: monospace;
+      color: var(--fg);
+    }
+  </style>
+</head>
+<body>
+  <h1>AkaneAI Proxy</h1>
+  <div class="subtitle">By Yuki Anastasya</div>
+
+  <p>This is a custom intelligent proxy built to power <strong>JanitorAI</strong> connections with dynamic rerouting, content detection, and metadata injection.</p>
+
+  <div class="section">
+    <h2>🔧 Features</h2>
+    <ul>
+      <li>Injects <span class="tag">&lt;TIME&gt;</span>, <span class="tag">&lt;LOCATION&gt;</span>, and real-time <span class="tag">WEATHER</span> metadata.</li>
+      <li>Detects <span class="tag">&lt;SERVICE:...&gt;</span> to reroute between OpenRouter, Gemini, and more.</li>
+      <li>Full header passthrough and logging support.</li>
+      <li>Modular, extensible prompt preprocessor and OOC tag support.</li>
+    </ul>
+  </div>
+
+  <div class="section">
+    <h2>📨 Contact</h2>
+    <ul>
+      <li>Discord: <a href="https://discord.gg/yourinvite">discord.gg/yourinvite</a></li>
+      <li>GitHub: <a href="https://github.com/yourname/akane-proxy">github.com/yourname/akane-proxy</a></li>
+      <li>Email: <a href="mailto:your.email@example.com">your.email@example.com</a></li>
+    </ul>
+  </div>
+
+  <footer>
+    &copy; 2025 Yuki Anastasya &bull; Powered by <strong>AkaneAI Proxy</strong>
+  </footer>
+</body>
+</html>
