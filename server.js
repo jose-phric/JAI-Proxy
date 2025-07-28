@@ -1,3 +1,5 @@
+// proxy_server_debug.js
+
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -6,10 +8,6 @@ const path = require("path");
 const JAILBREAK = require('./jailbreak.js');
 const app = express();
 const port = 3000;
-
-// Configs
-const WEATHER_API_KEY = process.env.WEATHER_API_KEY || 'e6a03e1a4bcd47d1ade91408252607';
-const weatherCache = {};
 
 const agent = new https.Agent({
   keepAlive: true,
@@ -29,19 +27,21 @@ app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-// --- Utility Functions ---
-function ensureMarkdownFormatting(text) {
-  return text.replace(/\n{3,}/g, '\n\n');
-}
-function cleanResponseText(text) {
-  return text.trim().replace(/^"(.*)"$/, '$1');
-}
 function extractApiKey(req) {
   if (req.headers.authorization?.startsWith('Bearer ')) {
     return req.headers.authorization.split(' ')[1].trim();
   }
   return req.headers['x-api-key'] || req.body?.api_key || req.query.api_key || '';
 }
+
+function ensureMarkdownFormatting(text) {
+  return text.replace(/\n{3,}/g, '\n\n');
+}
+
+function cleanResponseText(text) {
+  return text.trim().replace(/^"(.*)"$/, '$1');
+}
+
 function simulateStreamingResponse(content, res) {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -60,11 +60,13 @@ function simulateStreamingResponse(content, res) {
       object: 'chat.completion.chunk',
       created: Math.floor(Date.now() / 1000),
       model: 'proxy/auto',
-      choices: [{
-        delta: { content: words[index] + ' ' },
-        index: 0,
-        finish_reason: null
-      }]
+      choices: [
+        {
+          delta: { content: words[index] + ' ' },
+          index: 0,
+          finish_reason: null
+        }
+      ]
     };
     res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     index++;
@@ -73,35 +75,28 @@ function simulateStreamingResponse(content, res) {
   sendChunk();
 }
 
-// --- Gemini Handler ---
 async function routeToGemini(req, clientBody) {
-  const geminiKey = extractApiKey(req); // your custom dynamic key parser
-  const modelName = clientBody.model || 'gemini-pro'; // <- dynamically pulled
+  const geminiKey = extractApiKey(req);
+  const modelName = clientBody.model || 'gemini-pro';
   const endpoint = 'generateContent';
-
-  const messages = clientBody.messages.map(m => {
-    return `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`;
-  }).join('\n');
+  const messages = clientBody.messages.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n');
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:${endpoint}?key=${geminiKey}`;
 
   const response = await axios.post(
     url,
-    {
-      contents: [{ parts: [{ text: messages }] }]
-    },
-    {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 30000
-    }
+    { contents: [{ parts: [{ text: messages }] }] },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
   );
 
-  const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text || "No response.";
+  const content = response.data.candidates?.[0]?.content?.parts?.[0]?.text || "No response.";
   return {
-    choices: [{
-      message: { role: 'assistant', content: text },
-      finish_reason: 'stop'
-    }],
+    choices: [
+      {
+        message: { role: 'assistant', content },
+        finish_reason: 'stop'
+      }
+    ],
     id: `chat-${Date.now()}`,
     model: modelName,
     created: Math.floor(Date.now() / 1000),
@@ -109,8 +104,6 @@ async function routeToGemini(req, clientBody) {
   };
 }
 
-
-// --- OpenRouter Handler ---
 async function routeToOpenRouter(req, clientBody) {
   const apiKey = extractApiKey(req);
 
@@ -132,15 +125,13 @@ async function routeToOpenRouter(req, clientBody) {
   return response.data;
 }
 
-// --- Main Chat Route ---
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const clientBody = req.body;
-    let targetLLM = 'or'; // Default is OpenRouter
-
+    const isStreamingRequested = clientBody.stream;
+    let targetLLM = 'or';
     let systemMsg = clientBody.messages.find(m => m.role === 'system');
 
-    // Detect <LLM:gemini> or <LLM:or>
     if (systemMsg?.content) {
       const llmMatch = systemMsg.content.match(/<LLM:([\w-]+)>/i);
       if (llmMatch) {
@@ -148,57 +139,74 @@ app.post('/v1/chat/completions', async (req, res) => {
         systemMsg.content = systemMsg.content.replace(llmMatch[0], '').trim();
       }
 
-      // Check for <JAILBREAKON> if target is gemini
       if (targetLLM === 'gemini') {
         const jailbreakMatch = systemMsg.content.match(/<JAILBREAK:ON>/i);
         if (jailbreakMatch) {
-          console.log('\n🟠 [Original System Message]:');
-          console.log(systemMsg.content);
-    
           systemMsg.content = systemMsg.content.replace(jailbreakMatch[0], '').trim();
-    
-          if (typeof JAILBREAK !== 'string' || !JAILBREAK.trim()) {
-            console.error('❌ [ERROR] JAILBREAK string is not defined or empty!');
+
+          if (typeof JAILBREAK === 'string' && JAILBREAK.trim()) {
+            systemMsg.content = JAILBREAK.trim() + "\n\n" + systemMsg.content;
           } else {
-            systemMsg.content += JAILBREAK.trim() + "\n\n" + systemMsg.content;
-    
-            console.log('\n🟢 [System Message After Jailbreak Injected]:');
-            console.log(systemMsg.content);
+            console.error('❌ [JAILBREAK is empty or not a string!]');
           }
-        } else {
-          console.log('⚠️ No <JAILBREAK:ON> tag found.');
         }
       }
     }
 
-    // Log full prompt content
     const fullPrompt = clientBody.messages.map(msg => `${msg.role}: ${msg.content}`).join('\n\n');
-    console.log(`\n===========================\n🧠 Using LLM: ${targetLLM.toUpperCase()}\n===========================`);
-    console.log('[📨 Full Prompt Sent]:\n' + fullPrompt + '\n===========================\n');
-
+    console.log("📦 Client Body Sent to LLM:", JSON.stringify(clientBody, null, 2));
     let responseData;
-
     switch (targetLLM) {
       case 'gemini':
+
+
         responseData = await routeToGemini(req, clientBody);
         break;
-
+        
       case 'or':
       default:
         responseData = await routeToOpenRouter(req, clientBody);
         break;
+        
     }
 
-    res.status(200).json(responseData);
+    const content = ensureMarkdownFormatting(cleanResponseText(responseData.choices[0].message.content));
+
+    if (isStreamingRequested) {
+      simulateStreamingResponse(content, res);
+    } else {
+      res.status(200).json({
+        choices: [
+          {
+            message: { role: 'assistant', content },
+            finish_reason: responseData.choices[0].finish_reason || 'stop'
+          }
+        ],
+        created: responseData.created || Math.floor(Date.now() / 1000),
+        id: responseData.id || `chat-${Date.now()}`,
+        model: responseData.model,
+        object: 'chat.completion',
+        usage: responseData.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+      });
+    }
   } catch (err) {
-    console.error('[❌ Error]', err);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('[❌ Server Error]', err);
+    const errorMessage = err.response?.data?.error?.message || err.message;
+    if (req.body?.stream) {
+      simulateStreamingResponse(`❌ Error: ${errorMessage}`, res);
+    } else {
+      res.status(500).json({
+        choices: [
+          {
+            message: { role: 'assistant', content: `❌ Error: ${errorMessage}` },
+            finish_reason: 'error'
+          }
+        ]
+      });
+    }
   }
 });
 
-
-
-// --- Start Server ---
 app.listen(port, () => {
   console.log(`🚀 Proxy server running on port ${port}`);
   console.log(`🔁 Streaming simulation enabled`);
