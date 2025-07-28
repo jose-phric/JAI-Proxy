@@ -3,18 +3,18 @@ const cors = require('cors');
 const axios = require('axios');
 const https = require('https');
 const path = require("path");
-
-
+const JAILBREAK = require('./jailbreak.js');
 const app = express();
 const port = 3000;
 
-// Configuration constants
-const MODEL_DEFAULTS = {
-  temperature: 0.7,
-  topP: 0.9,
-  topK: 40
-};
+// Configs
 const WEATHER_API_KEY = process.env.WEATHER_API_KEY || 'e6a03e1a4bcd47d1ade91408252607';
+const weatherCache = {};
+
+const agent = new https.Agent({
+  keepAlive: true,
+  secureProtocol: 'TLSv1_2_method',
+});
 
 app.use(cors());
 app.use(express.json());
@@ -24,219 +24,179 @@ app.use((req, res, next) => {
   next();
 });
 
-const agent = new https.Agent({
-  keepAlive: true,
-  secureProtocol: 'TLSv1_2_method',
-});
-
-const weatherCache = {};
-
-// Serve static files from the "public" directory
-app.use(express.static(path.join(__dirname, 'public')));  
-
-// Serve the index.html file for the root pathapp.use(express.static(path.join(__dirname, 'public')));
-
+app.use(express.static(path.join(__dirname, 'public')));
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-
 // --- Utility Functions ---
-
-
 function ensureMarkdownFormatting(text) {
   return text.replace(/\n{3,}/g, '\n\n');
 }
-
 function cleanResponseText(text) {
   return text.trim().replace(/^"(.*)"$/, '$1');
 }
-
+function extractApiKey(req) {
+  if (req.headers.authorization?.startsWith('Bearer ')) {
+    return req.headers.authorization.split(' ')[1].trim();
+  }
+  return req.headers['x-api-key'] || req.body?.api_key || req.query.api_key || '';
+}
 function simulateStreamingResponse(content, res) {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
-  // Split content into words for more natural streaming
   const words = content.split(' ');
   let index = 0;
-
   const sendChunk = () => {
     if (index >= words.length) {
       res.write('data: [DONE]\n\n');
       res.end();
       return;
     }
-
-    // Send chunks as JSON objects like real OpenAI API
     const chunk = {
       id: `chat-${Date.now()}`,
       object: 'chat.completion.chunk',
       created: Math.floor(Date.now() / 1000),
-      model: 'openrouter/auto',
+      model: 'proxy/auto',
       choices: [{
         delta: { content: words[index] + ' ' },
         index: 0,
         finish_reason: null
       }]
     };
-
     res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     index++;
-    setTimeout(sendChunk, 20); // Adjust speed as needed
+    setTimeout(sendChunk, 20);
   };
-
   sendChunk();
 }
 
-// --- Core Handler ---
+// --- Gemini Handler ---
+async function routeToGemini(req, clientBody) {
+  const geminiKey = extractApiKey(req); // your custom dynamic key parser
+  const modelName = clientBody.model || 'gemini-pro'; // <- dynamically pulled
+  const endpoint = 'generateContent';
+
+  const messages = clientBody.messages.map(m => {
+    return `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`;
+  }).join('\n');
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:${endpoint}?key=${geminiKey}`;
+
+  const response = await axios.post(
+    url,
+    {
+      contents: [{ parts: [{ text: messages }] }]
+    },
+    {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 30000
+    }
+  );
+
+  const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text || "No response.";
+  return {
+    choices: [{
+      message: { role: 'assistant', content: text },
+      finish_reason: 'stop'
+    }],
+    id: `chat-${Date.now()}`,
+    model: modelName,
+    created: Math.floor(Date.now() / 1000),
+    object: 'chat.completion'
+  };
+}
+
+
+// --- OpenRouter Handler ---
+async function routeToOpenRouter(req, clientBody) {
+  const apiKey = extractApiKey(req);
+
+  const response = await axios.post(
+    'https://openrouter.ai/api/v1/chat/completions',
+    { ...clientBody, stream: false },
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'HTTP-Referer': 'https://janitorai.com',
+        'X-Title': 'Aria Extension'
+      },
+      httpsAgent: agent,
+      timeout: 30000
+    }
+  );
+
+  return response.data;
+}
+
+// --- Main Chat Route ---
 app.post('/v1/chat/completions', async (req, res) => {
-  const isStreamingRequested = req.body?.stream;
-  const clientBody = req.body;
-  
   try {
-    // --- Pre-process System Message ---
-    const systemMsg = clientBody.messages?.find(m => m.role === 'system');
+    const clientBody = req.body;
+    let targetLLM = 'or'; // Default is OpenRouter
+
+    let systemMsg = clientBody.messages.find(m => m.role === 'system');
+
+    // Detect <LLM:gemini> or <LLM:or>
     if (systemMsg?.content) {
-      const summaryMatch = systemMsg.content.match(/<summary>(.*?)<\/summary>/s);
-      if (summaryMatch) {
-        const tagContent = summaryMatch[1];
-        
-        // Time processing
-        const timeMatch = tagContent.match(/TIME:UTC([+-]\d+)/);
-        if (timeMatch) {
-          const offsetHours = parseInt(timeMatch[1]);
-          const serverTime = new Date(Date.now() + offsetHours * 3600000)
-            .toISOString().replace('T', ' ').slice(0, 19);
-          systemMsg.content += `\n <OOC : Current Time and Date: ${serverTime}>`;
-        }
-
-        // Location and weather processing
-        const locMatch = tagContent.match(/LOCATION:([\w\s-]+)/);
-        if (locMatch) {
-          const city = locMatch[1].trim();
-          const now = Date.now();
-          systemMsg.content += `\n <OOC : Location: ${city}>`;
-
-          if (weatherCache[city]?.timestamp && (now - weatherCache[city].timestamp < 3600000)) {
-            systemMsg.content += `\n <OOC : Current Weather ${weatherCache[city].text}, ${weatherCache[city].temp}°C>`;
-          } else {
-            try {
-              const { data } = await axios.get('https://api.weatherapi.com/v1/current.json', {
-                params: { key: 'e6a03e1a4bcd47d1ade91408252607', q: city, aqi: 'no' },
-                timeout: 5000
-              });
-              
-              if (data?.current) {
-                weatherCache[city] = {
-                  timestamp: now,
-                  text: data.current.condition.text,
-                  temp: data.current.temp_c
-                };
-                systemMsg.content += `\n🌤️ Weather: ${data.current.condition.text}, ${data.current.temp_c}°C`;
-              }
-            } catch (err) {
-              console.error('Weather API error:', err.message);
-            }
-          }
-        }
+      const llmMatch = systemMsg.content.match(/<LLM:([\w-]+)>/i);
+      if (llmMatch) {
+        targetLLM = llmMatch[1].toLowerCase();
+        systemMsg.content = systemMsg.content.replace(llmMatch[0], '').trim();
       }
-    }
 
-    // --- Prepare OpenRouter Payload ---
-    const openRouterPayload = {
-      ...clientBody,
-      messages: clientBody.messages,
-      stream: false // Always request full response from OpenRouter
-    };
-
-
-    // --- Call OpenRouter API ---
-    let apiKey = null;
-
-    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
-      apiKey = req.headers.authorization.split(' ')[1].trim();
-    } else if (req.headers['x-api-key']) {
-      apiKey = req.headers['x-api-key'].trim();
-    } else if (req.body?.api_key) {
-      apiKey = req.body.api_key;
-      delete req.body.api_key;
-    } else if (req.query.api_key) {
-      apiKey = req.query.api_key;
-    }
-
-    console.log('[OpenRouter] Sending request with:');
-console.log('→ URL:', 'https://openrouter.ai/api/v1/chat/completions');
-console.log('→ Headers:', {
-  'Content-Type': 'application/json',
-  'Authorization': `Bearer ${apiKey.slice(0, 5)}...redacted`,
-  'HTTP-Referer': 'https://janitorai.com',
-  'X-Title': 'Aria Extension'
-});
-console.log('→ Payload:', JSON.stringify(openRouterPayload, null, 2));
-    const response = await axios.post(
-      'https://openrouter.ai/api/v1/chat/completions',
-      openRouterPayload,
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-          'HTTP-Referer': 'https://janitorai.com',
-          'X-Title': 'Aria Extension'
-        },
-        httpsAgent: agent,
-        timeout: 30000
-      }
-    );
-    // --- Process Response ---
-    if (!response.data?.choices?.[0]?.message?.content) {
-      throw new Error('Invalid response structure from OpenRouter');
-    }
-
-    let content = response.data.choices[0].message.content;
-    content = cleanResponseText(content);
-    content = ensureMarkdownFormatting(content);
-
-    // --- Handle Streaming vs Non-Streaming ---
-    if (isStreamingRequested) {
-      simulateStreamingResponse(content, res);
-    } else {
-      res.json({
-        choices: [{
-          message: { role: 'assistant', content },
-          finish_reason: response.data.choices[0].finish_reason || 'stop'
-        }],
-        created: response.data.created || Math.floor(Date.now() / 1000),
-        id: response.data.id || `chat-${Date.now()}`,
-        model: response.data.model,
-        object: 'chat.completion',
-        usage: response.data.usage || { 
-          prompt_tokens: 0, 
-          completion_tokens: 0, 
-          total_tokens: 0 
-        }
-      });
-    }
-
-  } catch (err) {
-    console.error('Request failed:', err.message);
-    const errorMessage = err.response?.data?.error?.message || err.message;
+      // Check for <JAILBREAKON> if target is gemini
+      if (targetLLM === 'gemini') {
+        const jailbreakMatch = systemMsg.content.match(/<JAILBREAK:ON>/i);
+        if (jailbreakMatch) {
+          console.log('\n🟠 [Original System Message]:');
+          console.log(systemMsg.content);
     
-    if (isStreamingRequested) {
-      simulateStreamingResponse(`❌ Error: ${errorMessage}`, res);
-    } else {
-      res.status(500).json({
-        choices: [{
-          message: { 
-            role: 'assistant', 
-            content: `❌ Error: ${errorMessage}` 
-          },
-          finish_reason: 'error'
-        }]
-      });
+          systemMsg.content = systemMsg.content.replace(jailbreakMatch[0], '').trim();
+    
+          if (typeof JAILBREAK !== 'string' || !JAILBREAK.trim()) {
+            console.error('❌ [ERROR] JAILBREAK string is not defined or empty!');
+          } else {
+            systemMsg.content += JAILBREAK.trim() + "\n\n" + systemMsg.content;
+    
+            console.log('\n🟢 [System Message After Jailbreak Injected]:');
+            console.log(systemMsg.content);
+          }
+        } else {
+          console.log('⚠️ No <JAILBREAK:ON> tag found.');
+        }
+      }
     }
+
+    // Log full prompt content
+    const fullPrompt = clientBody.messages.map(msg => `${msg.role}: ${msg.content}`).join('\n\n');
+    console.log(`\n===========================\n🧠 Using LLM: ${targetLLM.toUpperCase()}\n===========================`);
+    console.log('[📨 Full Prompt Sent]:\n' + fullPrompt + '\n===========================\n');
+
+    let responseData;
+
+    switch (targetLLM) {
+      case 'gemini':
+        responseData = await routeToGemini(req, clientBody);
+        break;
+
+      case 'or':
+      default:
+        responseData = await routeToOpenRouter(req, clientBody);
+        break;
+    }
+
+    res.status(200).json(responseData);
+  } catch (err) {
+    console.error('[❌ Error]', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+
 
 // --- Start Server ---
 app.listen(port, () => {
