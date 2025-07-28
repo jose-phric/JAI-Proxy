@@ -118,7 +118,7 @@ async function routeToOpenRouter(req, clientBody) {
         'X-Title': 'Aria Extension'
       },
       httpsAgent: agent,
-      timeout: 30000
+      timeout: 300000
     }
   );
 
@@ -154,7 +154,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     const fullPrompt = clientBody.messages.map(msg => `${msg.role}: ${msg.content}`).join('\n\n');
-    console.log("📦 Client Body Sent to LLM:", JSON.stringify(clientBody, null, 2));
     let responseData;
     switch (targetLLM) {
       case 'gemini':
