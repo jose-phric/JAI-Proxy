@@ -1,12 +1,47 @@
+// Variables //
+const PORT = 4949;
+const JANITOR_URL = 'https://janitorai.com'; // referer header for requests
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-pro';
+const DEFAULT_TEMPERATURE = 0.85; // controls randomness in token selection, lower = more deterministic
+const DEFAULT_TIMEOUT = 60000;    // Time in miliseconds for timeout. (60 seconds)
+const DEFAULT_TOP_K = 64;         // determines how many of the most likely next tokens to consider
+const DEFAULT_TOP_P = 0.95;       // cumulative probability for token selection
+
+const ENABLE_NSFW = true;         // enables NSFW prefill
+const ENABLE_THINKING = false;    // enables thinking formatting
+const ENABLE_REMINDER = false;    // enables reminder for thinking formatting (should be redundant now)
+const JAILBREAK_REGEX = /<JAILBREAK(=ON)?>/i; // matches to <JAILBREAK> or <JAILBREAK=ON> (case insensitive)
+
+// Prompts //
+const JAILBREAK = require('./jailbreak.js');
+const NSFWPREFILL = require('./nsfwprefill.js');
+const ASSISSTANT_PROMPT = "Okay, I understand. I'm ready to begin the roleplay.";
+const THINKING_REMINDER = "Remember to use <think>...</think> for your reasoning and <response>... for your roleplay content.";
+const THINKING_PROMPT = `You must structure your response using thinking tags:
+
+<think>
+[Your internal analysis here]
+[Plan your roleplay response]
+[Consider character motivations]
+[Any reasoning or thoughts]
+</think>
+<response>\n
+[Your actual roleplay content goes here]
+
+This format helps separate your reasoning from the actual roleplay content.`;
+
+// Definitions //
 const express = require('express');
+const app = express();
 const cors = require('cors');
 const axios = require('axios');
+const zlib = require('zlib');
 const https = require('https');
 const path = require("path");
-const JAILBREAK = require('./jailbreak.js');
-const app = express();
-const port = 4949;
+const { pipeline } = require('node:stream/promises');
+const { Transform } = require('node:stream')
 
+// Initialization //
 const agent = new https.Agent({
   keepAlive: true,
   secureProtocol: 'TLSv1_2_method',
@@ -15,7 +50,7 @@ const agent = new https.Agent({
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Origin', JANITOR_URL);
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   next();
 });
@@ -25,11 +60,11 @@ app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
+// Helper Functions //
 function extractApiKey(req) {
   if (req.headers.authorization?.startsWith('Bearer ')) {
     return req.headers.authorization.split(' ')[1].trim();
   }
-  // return req.headers['x-api-key'] || req.body?.api_key || req.query.api_key || '';
 }
 
 function ensureMarkdownFormatting(text) {
@@ -41,28 +76,12 @@ function cleanResponseText(text) {
 }
 
 // Function to handle non-streaming Gemini requests
-async function routeToGemini(req, clientBody) {
-  console.log('➡️ Non-streaming request to Gemini detected');
-  const geminiKey = extractApiKey(req);
-  const modelName = clientBody.model || 'gemini-2.5-pro';
-  const endpoint = 'generateContent';
-
-  const contents = clientBody.messages.map(m => {
-    // The Gemini API expects a 'user' and 'model' role
-    const role = m.role === 'system' || m.role === 'user' ? 'user' : 'model';
-    return {
-      role: role,
-      parts: [{ text: m.content }]
-    };
-  });
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:${endpoint}?key=${geminiKey}`;
-
+async function routeToGemini(url, requestBody) {
   try {
     const response = await axios.post(
       url,
-      { contents: contents },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 60000 }
+      requestBody,
+      { headers: { 'Content-Type': 'application/json' }, timeout: DEFAULT_TIMEOUT }
     );
 
     const content = response.data.candidates?.[0]?.content?.parts?.[0]?.text || "No response.";
@@ -74,7 +93,7 @@ async function routeToGemini(req, clientBody) {
         }
       ],
       id: `chat-${Date.now()}`,
-      model: modelName,
+      model: responseData.model, // assuming model is available in responseData
       created: Math.floor(Date.now() / 1000),
       object: 'chat.completion'
     };
@@ -85,68 +104,16 @@ async function routeToGemini(req, clientBody) {
 }
 
 // Function to handle streaming Gemini requests
-async function streamToGemini(req, res, clientBody) {
-  console.log('➡️ Streaming request to Gemini detected');
-  const geminiKey = extractApiKey(req);
-  const modelName = clientBody.model || 'gemini-pro';
-  const endpoint = 'streamGenerateContent';
-
-  // Get the system instruction from the first message
-  const systemInstruction = {
-    parts: [
-      { text: clientBody.messages[0].content.trim() }
-    ]
-  };
-  console.log('System instruction:', systemInstruction);
-  // Get the rest of the messages for the 'contents' array
-  const chatMessages = clientBody.messages.slice(1);
-
-  // const contents = clientBody.messages.map(m => {
-  const contents = chatMessages.map(m => {
-    // The Gemini API expects a 'user' and 'model' role
-    const role = m.role === 'system' || m.role === 'user' ? 'user' : 'model';
-    return {
-      role: role,
-      parts: [{ text: m.content }]
-    };
-  });
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:${endpoint}?key=${geminiKey}`;
-
-  // try {
-  //   const response = await axios.post(
-  //     url,
-  //     { contents: contents },
-  //     {
-  //       headers: { 'Content-Type': 'application/json' },
-  //       responseType: 'stream',
-  //       timeout: 300000
-  //     }
-  //   );
-
+async function streamToGemini(res, url, requestBody, modelName) {
   try {
     const response = await axios.post(
       url,
-      {
-        system_instruction: systemInstruction,
-        contents: contents,
-        generation_config: {
-          temperature: 0.9,
-          top_k: 40,
-          top_p: 0.9,
-          max_output_tokens: 4096
-        },
-        safety_settings: [
-          { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE" },
-          { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE" },
-          { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE" },
-          { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE" }
-        ]
-      },
+      requestBody,
       {
         headers: { 'Content-Type': 'application/json' },
         responseType: 'stream',
-        timeout: 300000
+        timeout: DEFAULT_TIMEOUT,
+        httpsAgent: agent
       }
     );
 
@@ -154,97 +121,113 @@ async function streamToGemini(req, res, clientBody) {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
+    let dataStream = response.data;
+    const pipelineSteps = [dataStream];
+
+    if (response.headers['content-encoding'] === 'gzip') {
+      console.log('➡️ Response is GZIPPED, adding unzip stream');
+      pipelineSteps.push(zlib.createUnzip());
+    }
+    
     let buffer = '';
-    response.data.on('data', chunk => {
-        buffer += chunk.toString('utf-8');
+    const textDecoder = new TextDecoder();
+    
+    const customParserStream = new Transform({
+      transform(chunk, encoding, callback) {
+        buffer += textDecoder.decode(chunk, { stream: true });
         let lastProcessedIndex = 0;
-
-        // This robust parser finds complete JSON objects by balancing curly braces.
+        
         while (true) {
-            let braceCount = 0;
-            let startIndex = -1;
-            let endIndex = -1;
-            let inString = false;
-
-            // Find the start of the next JSON object
-            for (let i = lastProcessedIndex; i < buffer.length; i++) {
-                if (buffer[i] === '{') {
-                    startIndex = i;
-                    break;
-                }
+          let braceCount = 0;
+          let startIndex = -1;
+          let endIndex = -1;
+          let inString = false;
+          
+          for (let i = lastProcessedIndex; i < buffer.length; i++) {
+            if (buffer[i] === '{') {
+              startIndex = i;
+              break;
             }
+          }
+          
+          if (startIndex === -1) break;
+          
+          for (let i = startIndex; i < buffer.length; i++) {
+            const char = buffer[i];
+            if (char === '"' && (i === 0 || buffer[i - 1] !== '\\')) {
+              inString = !inString;
+            }
+            if (!inString) {
+              if (char === '{') braceCount++;
+              else if (char === '}') braceCount--;
+            }
+            if (braceCount === 0) {
+              endIndex = i;
+              break;
+            }
+          }
+          
+          if (endIndex === -1) break;
+          
+          const jsonString = buffer.substring(startIndex, endIndex + 1);
+          lastProcessedIndex = endIndex + 1;
+          
+          try {
+            const data = JSON.parse(jsonString);
+            const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
             
-            if (startIndex === -1) break; // No more JSON objects in the buffer
-
-            // Find the corresponding end of the JSON object
-            for (let i = startIndex; i < buffer.length; i++) {
-                const char = buffer[i];
-                if (char === '"' && (i === 0 || buffer[i - 1] !== '\\')) {
-                    inString = !inString;
-                }
-                if (!inString) {
-                    if (char === '{') braceCount++;
-                    else if (char === '}') braceCount--;
-                }
-                if (braceCount === 0 && startIndex !== -1) {
-                    endIndex = i;
-                    break;
-                }
+            if (text) {
+              const formattedChunk = {
+                id: `chatcmpl-${Date.now()}`,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: modelName,
+                choices: [{
+                  delta: { content: text },
+                  index: 0,
+                  finish_reason: null
+                }]
+              };
+              this.push(`data: ${JSON.stringify(formattedChunk)}\n\n`);
             }
-
-            if (endIndex === -1) break; // Incomplete JSON object, wait for more data
-
-            const jsonString = buffer.substring(startIndex, endIndex + 1);
-            lastProcessedIndex = endIndex + 1;
-
-            try {
-                const data = JSON.parse(jsonString);
-                const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-                
-                if (text) {
-                    console.log('✅ Streaming chunk:', text);
-                    const formattedChunk = {
-                        id: `chatcmpl-${Date.now()}`,
-                        object: "chat.completion.chunk",
-                        created: Math.floor(Date.now() / 1000),
-                        model: modelName,
-                        choices: [{
-                            delta: { content: text },
-                            index: 0,
-                            finish_reason: null
-                        }]
-                    };
-                    res.write(`data: ${JSON.stringify(formattedChunk)}\n\n`);
-                }
-            } catch (e) {
-                console.error(`❌ Error parsing a full JSON object: ${e.message}`);
-                console.error(`❌ Raw data that failed to parse: '${jsonString}'`);
-            }
+          } catch (e) {
+            console.error(`❌ Error parsing a JSON object: ${e.message}`);
+            console.error(`❌ Raw data that failed to parse: '${jsonString}'`);
+          }
         }
         
-        // Keep the unprocessed part of the buffer
-        if (lastProcessedIndex > 0) {
-            buffer = buffer.substring(lastProcessedIndex);
-        }
-    });
-
-    response.data.on('end', () => {
-        // Send a final chunk to signal the end of the stream
+        buffer = buffer.substring(lastProcessedIndex);
+        callback();
+      },
+      
+      flush(callback) {
         const endChunk = {
-            id: `chatcmpl-${Date.now()}`,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: modelName,
-            choices: [{
-                delta: {},
-                index: 0,
-                finish_reason: "stop"
-            }]
+          id: `chatcmpl-${Date.now()}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: modelName,
+          choices: [{
+            delta: {},
+            index: 0,
+            finish_reason: "stop"
+          }]
         };
-        res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
-        res.end();
+        this.push(`data: ${JSON.stringify(endChunk)}\n\n`);
+        callback();
+      }
     });
-
+    
+    pipelineSteps.push(customParserStream, res);
+    
+    await pipeline(...pipelineSteps)
+    .catch(err => {
+      console.error('[❌ Gemini Streaming Pipeline Error]', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to stream from Gemini.' });
+      } else {
+        res.end();
+      }
+    });
   } catch (err) {
     console.error('[❌ Gemini Streaming Error]', err.response ? err.response.data : err.message);
     if (!res.headersSent) {
@@ -255,8 +238,105 @@ async function streamToGemini(req, res, clientBody) {
   }
 }
 
+// Gemini endpoint
+app.post('/gemini', async (req, res) => {
+  try {
+    const clientBody = req.body;
+    const isStreamingRequested = clientBody.stream;
+    const geminiKey = extractApiKey(req);
+    if (!geminiKey) {
+      console.error('[❌ Gemini Error] No API key provided.');
+      res.status(401).json({ error: 'Unauthorized: No API key provided.' });
+      return;
+    }
+    
+    const modelName = clientBody.model || DEFAULT_GEMINI_MODEL;
+    const endpoint = isStreamingRequested ? 'streamGenerateContent' : 'generateContent';
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:${endpoint}?key=${geminiKey}`;
+
+    let systemPrompt = clientBody.messages[0].content.trim();
+    if (ENABLE_NSFW) {
+      systemPrompt += `\n\n${NSFWPREFILL}`;
+    }
+    if (ENABLE_THINKING) {
+      systemPrompt += `\n\n${THINKING_PROMPT}`;
+    }
+    if (ENABLE_REMINDER) {
+      systemPrompt += `\n\n${THINKING_REMINDER}`;
+    }
+
+    const hasJailbreak = JAILBREAK_REGEX.test(systemPrompt);
+    if (hasJailbreak && typeof JAILBREAK === 'string' && JAILBREAK.trim()) {
+      systemPrompt = systemPrompt.replace(JAILBREAK_REGEX, JAILBREAK.trim());
+    }
+
+    // Prepare messages for Gemini API
+    const messagesForGemini = isStreamingRequested
+      ? clientBody.messages.slice(1) // slice(1) to exclude system prompt
+      : clientBody.messages;
+    
+    const contents = messagesForGemini.map(m => {
+      const role = m.role === 'system' || m.role === 'user' ? 'user' : 'model';
+      return {
+        role: role,
+        parts: [{ text: m.content }]
+      };
+    });
+
+    const requestBody = {
+      system_instruction: { parts: [{ text: systemPrompt }] },
+      contents: contents,
+      generation_config: {
+        temperature: clientBody.temperature || DEFAULT_TEMPERATURE,
+        top_k: DEFAULT_TOP_K,
+        top_p: DEFAULT_TOP_P,
+      },
+      safety_settings: [
+        { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE" },
+        { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE" },
+        { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE" },
+        { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE" }
+      ]
+    };
+
+    if (isStreamingRequested) {
+      await streamToGemini(res, url, requestBody, modelName);
+      return;
+    }
+
+    const responseData = await routeToGemini(url, requestBody);
+    const content = ensureMarkdownFormatting(cleanResponseText(responseData.choices[0].message.content));
+
+    res.status(200).json({
+      choices: [
+        {
+          message: { role: 'assistant', content },
+          finish_reason: responseData.choices[0].finish_reason || 'stop'
+        }
+      ],
+      created: responseData.created || Math.floor(Date.now() / 1000),
+      id: responseData.id || `chat-${Date.now()}`,
+      model: responseData.model,
+      object: 'chat.completion',
+      usage: responseData.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+    });
+
+  } catch (err) {
+    console.error('[❌ Server Error on /gemini]', err.response ? err.response.data : err.message);
+    const errorMessage = err.response?.data?.error?.message || err.message;
+    res.status(500).json({
+      choices: [
+        {
+          message: { role: 'assistant', content: `❌ Error: ${errorMessage}` },
+          finish_reason: 'error'
+        }
+      ]
+    });
+  }
+});
+
 async function routeToOpenRouter(req, clientBody) {
-  console.log('➡️ Non-streaming request to OpenRouter detected');
+  // console.log('➡️ Non-streaming request to OpenRouter detected');
   const apiKey = extractApiKey(req);
 
   try {
@@ -267,11 +347,11 @@ async function routeToOpenRouter(req, clientBody) {
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${apiKey}`,
-          'HTTP-Referer': 'https://janitorai.com',
-          'X-Title': 'Aria Extension'
+          'HTTP-Referer': JANITOR_URL,
+          'X-Title': 'Shoddy Aria Extension'
         },
         httpsAgent: agent,
-        timeout: 60000
+        timeout: DEFAULT_TIMEOUT
       }
     );
     return response.data;
@@ -286,10 +366,10 @@ app.post('/openrouter', async (req, res) => {
   try {
     const clientBody = req.body;
     const isStreamingRequested = clientBody.stream;
-    console.log(`🔄 Request received on /openrouter. Streaming: ${isStreamingRequested}`);
+    // console.log(`🔄 Request received on /openrouter. Streaming: ${isStreamingRequested}`);
 
     if (isStreamingRequested) {
-      console.log('🔄 Streaming request to OpenRouter detected');
+      // console.log('🔄 Streaming request to OpenRouter detected');
       const apiKey = extractApiKey(req);
       try {
         const response = await axios.post(
@@ -299,12 +379,12 @@ app.post('/openrouter', async (req, res) => {
             headers: {
               'Content-Type': 'application/json',
               'Authorization': `Bearer ${apiKey}`,
-              'HTTP-Referer': 'https://janitorai.com',
-              'X-Title': 'Aria Extension'
+              'HTTP-Referer': JANITOR_URL,
+              'X-Title': 'Shoddy Aria Extension'
             },
             httpsAgent: agent,
             responseType: 'stream',
-            timeout: 60000
+            timeout: DEFAULT_TIMEOUT
           }
         );
 
@@ -352,131 +432,6 @@ app.post('/openrouter', async (req, res) => {
   }
 });
 
-
-// A flag to enable or disable the NSFW prefill
-const ENABLE_NSFW = true;
-
-// Enhanced NSFW prefill for roleplay
-const nsfwPrefill = require('./nsfwprefill.js');
-
-// A flag to enable or disable the "thinking" prompts
-const ENABLE_THINKING = true;
-
-// Enhanced thinking prompt - encourages tag usage
-const thinkingPrompt = `You should structure your response using thinking tags:
-
-<think>
-[Your internal analysis here]
-[Plan your roleplay response]
-[Consider character motivations]
-[Any reasoning or thoughts]
-</think>
-<response>
-[Your actual roleplay content goes here]
-
-This format helps separate your reasoning from the actual roleplay content.`;
-
-// Reminder message for thinking
-const reminder = "Remember to use <think>...</think> for your reasoning and <response>... for your roleplay content.";
-
-// Custom assistant prompt to prime the model
-const customAssistantPrompt = "Okay, I understand. I'm ready to begin the roleplay.";
-
-// New endpoint for Gemini
-app.post('/gemini', async (req, res) => {
-  try {
-    const clientBody = req.body;
-    const isStreamingRequested = clientBody.stream;
-    console.log(`🔄 Request received on /gemini. Streaming: ${isStreamingRequested}`);
-
-    let messages = clientBody.messages;
-
-    // 1. Separate all system and conversational messages
-    const systemMessages = messages.filter(m => m.role === 'system').map(m => m.content);
-    let conversationMessages = messages.filter(m => m.role !== 'system');
-    
-    // 2. Combine all system-related prompts into one string
-    let consolidatedSystemPrompt = systemMessages.join('\n\n');
-
-    // 3. Add fixed system prompts (NSFW, thinking)
-    if (ENABLE_NSFW) {
-      consolidatedSystemPrompt += `\n\n${nsfwPrefill}`;
-      if (ENABLE_THINKING) {
-        consolidatedSystemPrompt += `\n\n${thinkingPrompt}\n\n${reminder}`;
-      }
-    }
-
-    const jailbreakOnTag = '<JAILBREAK=ON>';
-    const hasJailbreakTag = consolidatedSystemPrompt.includes(jailbreakOnTag);
-
-    // 4. Apply jailbreak if the tag was present in the original system message
-    if (hasJailbreakTag && typeof JAILBREAK === 'string' && JAILBREAK.trim()) {
-      // Use replace to directly replace the tag with the JAILBREAK content
-      consolidatedSystemPrompt = consolidatedSystemPrompt.replace(jailbreakOnTag, JAILBREAK.trim());
-    }
-
-    // 5. Construct the final message array with a single consolidated system message
-    const finalMessages = [];
-
-    // Add the single, consolidated system prompt at the beginning
-    if (consolidatedSystemPrompt.trim()) {
-      finalMessages.push({ role: 'user', content: consolidatedSystemPrompt.trim() });
-      // Add a placeholder response from the model to maintain conversational turn.
-      finalMessages.push({ role: 'assistant', content: customAssistantPrompt });
-    }
-
-    // Append the rest of the conversation messages
-    conversationMessages.forEach(msg => {
-      if (msg.content && msg.content.trim()) {
-        finalMessages.push({ role: msg.role, content: msg.content });
-      }
-    });
-
-    // Update the clientBody with the new message structure
-    clientBody.messages = finalMessages;
-
-    // --- DEBUGGING OUTPUT ---
-    console.log('--- FINAL MESSAGES SENT TO GEMINI API ---');
-    console.log(JSON.stringify(clientBody.messages, null, 2));
-    console.log('-----------------------------------------');
-
-    if (isStreamingRequested) {
-      await streamToGemini(req, res, clientBody);
-      return;
-    }
-
-    const responseData = await routeToGemini(req, clientBody);
-    const content = ensureMarkdownFormatting(cleanResponseText(responseData.choices[0].message.content));
-
-    res.status(200).json({
-      choices: [
-        {
-          message: { role: 'assistant', content },
-          finish_reason: responseData.choices[0].finish_reason || 'stop'
-        }
-      ],
-      created: responseData.created || Math.floor(Date.now() / 1000),
-      id: responseData.id || `chat-${Date.now()}`,
-      model: responseData.model,
-      object: 'chat.completion',
-      usage: responseData.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-    });
-
-  } catch (err) {
-    console.error('[❌ Server Error on /gemini]', err.response ? err.response.data : err.message);
-    const errorMessage = err.response?.data?.error?.message || err.message;
-    res.status(500).json({
-      choices: [
-        {
-          message: { role: 'assistant', content: `❌ Error: ${errorMessage}` },
-          finish_reason: 'error'
-        }
-      ]
-    });
-  }
-});
-
-
-app.listen(port, () => {
-  console.log(`🚀 Proxy server running on port ${port}`);
+app.listen(PORT, () => {
+  console.log(`🚀 Proxy server running on PORT ${PORT}`);
 });
