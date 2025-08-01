@@ -1,3 +1,7 @@
+// Debug flags //
+const DEBUG = true;               // enables debug logging
+const DEBUG_CONTENT = false;
+
 // Variables //
 const PORT = 4949;
 const JANITOR_URL = 'https://janitorai.com'; // referer header for requests
@@ -8,7 +12,7 @@ const DEFAULT_TOP_K = 64;         // determines how many of the most likely next
 const DEFAULT_TOP_P = 0.95;       // cumulative probability for token selection
 
 const ENABLE_NSFW = true;         // enables NSFW prefill
-const ENABLE_THINKING = false;    // enables thinking formatting
+const ENABLE_THINKING = true;     // enables thinking formatting
 const ENABLE_REMINDER = false;    // enables reminder for thinking formatting (should be redundant now)
 const JAILBREAK_REGEX = /<JAILBREAK(=ON)?>/i; // matches to <JAILBREAK> or <JAILBREAK=ON> (case insensitive)
 
@@ -93,7 +97,6 @@ async function routeToGemini(url, requestBody) {
         }
       ],
       id: `chat-${Date.now()}`,
-      model: responseData.model, // assuming model is available in responseData
       created: Math.floor(Date.now() / 1000),
       object: 'chat.completion'
     };
@@ -125,7 +128,7 @@ async function streamToGemini(res, url, requestBody, modelName) {
     const pipelineSteps = [dataStream];
 
     if (response.headers['content-encoding'] === 'gzip') {
-      console.log('➡️ Response is GZIPPED, adding unzip stream');
+      if (DEBUG) console.log('➡️ Response is GZIPPED, adding unzip stream');
       pipelineSteps.push(zlib.createUnzip());
     }
     
@@ -251,6 +254,7 @@ app.post('/gemini', async (req, res) => {
     }
     
     const modelName = clientBody.model || DEFAULT_GEMINI_MODEL;
+    if (DEBUG) console.log(`🔄 Request received on /gemini. Model: ${modelName}, Streaming: ${isStreamingRequested}`);
     const endpoint = isStreamingRequested ? 'streamGenerateContent' : 'generateContent';
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:${endpoint}?key=${geminiKey}`;
 
@@ -271,10 +275,14 @@ app.post('/gemini', async (req, res) => {
     }
 
     // Prepare messages for Gemini API
-    const messagesForGemini = isStreamingRequested
-      ? clientBody.messages.slice(1) // slice(1) to exclude system prompt
-      : clientBody.messages;
-    
+    if (clientBody.messages.length > 0 && clientBody.messages[0].role === 'system') {
+      messagesForGemini = clientBody.messages.slice(1);
+    } else {
+      // If no system prompt is found, use the entire message list
+      messagesForGemini = clientBody.messages;
+    }
+    if (DEBUG_CONTENT) console.log('Messages prepared for Gemini:', messagesForGemini);
+
     const contents = messagesForGemini.map(m => {
       const role = m.role === 'system' || m.role === 'user' ? 'user' : 'model';
       return {
@@ -336,7 +344,6 @@ app.post('/gemini', async (req, res) => {
 });
 
 async function routeToOpenRouter(req, clientBody) {
-  // console.log('➡️ Non-streaming request to OpenRouter detected');
   const apiKey = extractApiKey(req);
 
   try {
@@ -366,10 +373,9 @@ app.post('/openrouter', async (req, res) => {
   try {
     const clientBody = req.body;
     const isStreamingRequested = clientBody.stream;
-    // console.log(`🔄 Request received on /openrouter. Streaming: ${isStreamingRequested}`);
+    if (DEBUG) console.log(`🔄 Request received on /openrouter. Streaming: ${isStreamingRequested}`);
 
     if (isStreamingRequested) {
-      // console.log('🔄 Streaming request to OpenRouter detected');
       const apiKey = extractApiKey(req);
       try {
         const response = await axios.post(
